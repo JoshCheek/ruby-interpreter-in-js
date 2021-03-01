@@ -1,0 +1,10 @@
+#!/usr/bin/env ruby
+require 'parser/current'
+require 'json'
+
+def as_json(ast)
+  return ast unless ast.is_a? AST::Node
+  [ ast.type, *ast.children ].map { |child| as_json child }
+end
+
+puts as_json(Parser::CurrentRuby.parse($stdin.read)).to_json

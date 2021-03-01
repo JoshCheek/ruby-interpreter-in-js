@@ -1,0 +1,357 @@
+#!/usr/bin/env node
+const fs         = require('fs')
+const { spawn }  = require('child_process')
+const util       = require('util')
+const parserPath = `${__dirname}/parse`
+
+setImmediate(async function() {
+  const programName = process.argv[2]
+  const body = fs.readFileSync(programName, 'utf8')
+  const ast  = await parse(body)
+  const interpreter = new Interpreter({ stdout: process.stdout })
+  try {
+    interpreter.interpret(ast)
+  } catch(e) {
+    console.error(e)
+    process.exit(1)
+  }
+})
+
+function parse(rubyCode) {
+  const program = spawn(parserPath, [])
+  let stdout = ''
+  program.stdout.on('data', data => stdout += data)
+  program.stderr.on('data', console.error)
+  program.stdin.write(rubyCode)
+  program.stdin.end()
+  return new Promise((resolve, reject) => {
+    program.on('close', code => resolve(stdout))
+    program.on('error', reject)
+  }).then(JSON.parse)
+}
+
+
+function rbInspect(str, options) {
+  return `rb(${options.stylize(str, 'special')})`
+}
+
+function inspectClass(depth, options) {
+  return rbInspect(this.name, options)
+}
+
+function inspectObj(depth, options) {
+  if(!this.class) {
+    return '' + this
+  } else {
+    let fn = this.class.jsInspect
+    if(fn) return fn(this, depth, options)
+    return rbInspect(`#<${this.class.name}>`, options)
+  }
+}
+
+class Interpreter {
+  constructor({ stdout }) {
+    this.stdout = stdout
+    this.interpret = this.interpret.bind(this)
+
+    const nil = this.allocate(null) // no class for now
+    this.nil = nil
+
+    const classClass = {
+      name:       'Class',
+      class:      nil, // circular reference filled in after allocation
+      ivars:      {},
+      superclass: nil, // in reality: Module
+      methods:    { new: this.fnClassNew() },
+      constants:  {},
+    }
+    classClass.class = classClass
+    this.classClass  = classClass
+
+    const objectClass = this.allocateClass('Object', nil) // in reality, superclass is BasicObject
+    this.objectClass  = objectClass
+    this.constantBase = objectClass
+    objectClass.constants = {
+      Object: objectClass,
+      Class:  classClass,
+    }
+    objectClass.methods.puts = this.fnObjectPuts() // in reality this goes in Kernel
+
+    this.stringClass = this.openClass(objectClass, 'String')
+    this.stringClass.jsInspect = function(str, depth, options) {
+      return rbInspect(util.inspect(int.internalData), options)
+    }
+
+    this.integerClass = this.openClass(objectClass, 'String')
+    this.integerClass.jsInspect = function(int, depth, options) {
+      return rbInspect(util.inspect(int.internalData), options)
+    }
+    this.integerClass.methods["+"] = this.fnIntegerPlus()
+
+    const main = {
+      class: objectClass, // in reality, it has a singleton class that defines `to_s` and `inspect`
+      ivars: {},
+    }
+
+    this.stack = []
+    this.pushBinding(main)
+  }
+
+  interpret(ast) {
+    if (ast === null || ast.constructor !== Array)
+      return ast
+
+    const [type, ...children] = ast
+    switch(type) {
+      case 'begin': {
+        let lastResult = this.nil
+        children.forEach(ast => { lastResult = this.interpret(ast) })
+        return lastResult
+
+      } case 'class': {
+        const [nameAst, superclass, body] = children
+        const [namespace, name] = this.resolveConstant(nameAst)
+        const klass = this.openClass(namespace, name, superclass)
+        this.pushBinding(klass)
+        const result = this.interpret(body)
+        this.popBinding()
+        return result
+
+      } case 'def': {
+        const klass = this.currentBinding().self
+        const [name, [_type, ...params], body] = children
+        klass.methods[name] = { type: 'ast', params: params, body }
+        return name
+
+      } case 'lvasgn': {
+        const [name, valueAst] = children
+        const value = this.interpret(valueAst)
+        this.setLocals({[name]: value})
+        return value
+
+      } case 'send': {
+        const [receiverAst, methodName, ...argAsts] = children
+        const receiver = this.interpret(receiverAst)
+        const args     = argAsts.map(this.interpret)
+        const method   = this.findMethod(receiver, methodName)
+        const returned = this.callMethod(receiver, method, args)
+        return returned
+
+      } case 'const': {
+        const [namespace, name] = this.resolveConstant(ast)
+        return namespace.constants[name]
+
+      } case 'str': {
+        return this.newString(children[0])
+
+      } case 'int': {
+        return this.newInt(children[0])
+
+      } case 'ivasgn': {
+        const [name, valueAst] = children
+        const value = this.interpret(valueAst)
+        this.self().ivars[name] = value
+        return value
+
+      } case 'ivar': {
+        const name = children[0]
+        const value = this.self().ivars[name]
+        return value
+
+      } case 'lvar': {
+        const name = children[0]
+        const value = this.currentBinding().locals[name]
+        return value
+
+      } case 'dstr': {
+        let str = ""
+        children.forEach(ast => {
+          const value = this.interpret(ast)
+          str += value.internalData
+        })
+        return this.newString(str)
+
+      } default: {
+        throw `UNHANDLED AST TYPE: ${type}`
+      }
+    }
+  }
+
+  currentBinding() {
+    return this.stack[this.stack.length-1]
+  }
+
+  setLocals(locals) {
+    const binding = this.currentBinding()
+    binding.locals = { ...binding.locals, ...locals }
+  }
+
+  pushBinding(self) {
+    const binding = { self, locals: {}, result: this.nil }
+    this.stack.push(binding)
+    return binding
+  }
+
+  popBinding() {
+    return this.stack.pop()
+  }
+
+  self() {
+    return this.currentBinding().self
+  }
+
+  getLocal(name) {
+    return this.currentBinding().locals[name]
+  }
+
+  resolveConstant(nameAst) {
+    if(nameAst === null)
+      return [this.constantBase, 'Object']
+    const [type, ...children] = nameAst
+    switch (type) {
+      case 'const':
+        const [namespaceAst, name]  = children
+        const [nsNamespace, nsName] = this.resolveConstant(namespaceAst)
+        const namespace             = nsNamespace.constants[nsName] // bug: this may not exist
+        return [namespace, name]
+        break
+      default:
+        throw `UNHANDLED CONSTANT TYPE: ${type}`
+    }
+    throw `IMPLEMENT ME!`
+    return [namespace, name]
+  }
+
+  openClass(namespace, name, superclass) {
+    return namespace.constants[name] || (
+      namespace.constants[name] = this.allocateClass(name, superclass)
+    )
+  }
+
+  allocateClass(name, superclass) {
+    return {
+      name:       name,
+      class:      this.classClass,
+      ivars:      {},
+      superclass: (superclass ?? this.objectClass),
+      methods:    {},
+      constants:  {},
+      [util.inspect.custom]: inspectClass,
+    }
+  }
+
+
+  allocate(klass) {
+    return {
+      class: klass,
+      ivars: {},
+      [util.inspect.custom]: inspectObj,
+    }
+  }
+
+  newInternalData(klass, internalData) {
+    const obj = this.allocate(klass)
+    obj.internalData = internalData
+    return obj
+  }
+
+  newString(rawString) {
+    return this.newInternalData(this.stringClass, rawString)
+  }
+
+  newInt(rawInt) {
+    return this.newInternalData(this.integerClass, rawInt)
+  }
+
+  findMethod(receiver, name) {
+    if(receiver === null) {
+      receiver = this.self()
+    }
+    let klass = receiver.class
+    while ( !(name in klass.methods) && klass.superclass) {
+      klass = klass.superclass
+    }
+    return klass.methods[name] // in reality, should walk up the inheritance hierarchy
+  }
+
+  callMethod(receiver, method, args) {
+    this.pushBinding(receiver)
+    const locals = this.matchArgsToParams(args, method.params)
+    this.setLocals(locals)
+
+    let returned
+    switch(method.type) {
+      case "ast":
+        returned = this.interpret(method.body)
+        break
+      case "internal":
+        returned = method()
+        break
+      default:
+        throw `IMPLEMENT METHOD TYPE ${method.type}`
+    }
+
+    this.popBinding()
+    return returned
+  }
+
+  matchArgsToParams(args, params) {
+    const locals = {}
+    let i = 0
+
+    params.forEach(([type, name]) => {
+      switch(type) {
+        case 'arg': {
+          locals[name] = args[i++]
+          break
+        } case 'restarg': {
+          locals[name] = []
+          while(i < args.length) locals[name].push(args[i++])
+          break
+        } default: {
+          console.log(params)
+          throw `UNHANDLED ARG type: ${type}, name: ${name}`
+        }
+      }
+    })
+
+    return locals
+  }
+
+  fnClassNew() {
+    return this.internalFunction([['restarg', 'zomgih']], () => {
+      const obj = this.allocate(this.self())
+      const args = this.getLocal('zomgih')
+      const initialize = this.findMethod(obj, 'initialize')
+      this.callMethod(obj, initialize, args)
+      return obj
+    })
+  }
+
+  fnObjectPuts() {
+    return this.internalFunction([['arg', 'str']], () => {
+      const rbStr = this.getLocal('str')
+      let jsStr = rbStr.internalData
+      if(!jsStr || jsStr[jsStr.length] != "\n")
+        jsStr += "\n"
+      this.stdout.write(jsStr)
+      return this.nil
+    })
+  }
+
+  fnIntegerPlus() {
+    return this.internalFunction([['arg', 'rhs']], () => {
+      const lhs = this.self()
+      const rhs = this.getLocal('rhs')
+      const sum = lhs.internalData + rhs.internalData
+      return this.newInt(sum)
+    })
+  }
+
+  internalFunction(params, fn) {
+    fn.type   = 'internal'
+    fn.params = params
+    return fn
+  }
+
+}
